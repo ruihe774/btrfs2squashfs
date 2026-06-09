@@ -26,14 +26,20 @@
 // uncompressed squashfs blocks - still no recompression. All-zero blocks
 // become squashfs sparse blocks. Metadata tables are stored uncompressed.
 //
-// Limitations (POC): no xattrs, no hard-link dedup, directory listings
-// < 64 KiB.
+// Duplicate files (including hard links) are stored once: candidates are
+// found by hashing the per-sector checksums btrfs already keeps in its csum
+// tree (read via BTRFS_IOC_TREE_SEARCH_V2 - no checksum is computed here),
+// then confirmed by pread'ing the already-written copy back from the image
+// and comparing bytes, so no data blocks are kept in memory.
+//
+// Limitations (POC): no xattrs, directory listings < 64 KiB.
 //
 // Usage: sudo btrfs2squashfs <source-dir> <output.squashfs>
 // (BTRFS_IOC_ENCODED_READ requires CAP_SYS_ADMIN.)
 
 const std = @import("std");
 const linux = std.os.linux;
+const Dedup = @import("dedup.zig").Dedup;
 
 const block_size: u32 = 131072;
 const block_log: u16 = 17;
@@ -165,6 +171,7 @@ const Node = struct {
     mtime: u32,
     size: u64 = 0,
     rdev: u32 = 0,
+    ino: u64 = 0, // btrfs inode number, used for dedup key lookups
     inum: u32 = 0,
     children: std.ArrayListUnmanaged(*Node) = .{},
     // location of this node's inode in the inode table, filled during write
@@ -211,6 +218,7 @@ const Builder = struct {
             .mtime = std.math.lossyCast(u32, st.mtim.sec),
             .size = @intCast(st.size),
             .rdev = squashfsRdev(st.rdev),
+            .ino = st.ino,
         };
         return node;
     }
@@ -256,6 +264,22 @@ const FragEntry = struct {
     size: u32,
 };
 
+// Everything needed to point a later identical file at the already-written
+// copy of the same data, and to verify the two really match.
+const FileRecord = struct {
+    size: u64,
+    start: u64, // block-data start (after the tail fragment, if any)
+    range_begin: u64, // first byte this file wrote to the image
+    range_end: u64,
+    frag_idx: u32,
+    frag_size: u32,
+    sizes: []const u32, // block-list entries
+};
+
+fn preadFull(f: std.fs.File, buf: []u8, off: u64) !void {
+    if (try f.preadAll(buf, off) != buf.len) return error.UnexpectedEof;
+}
+
 const Writer = struct {
     alloc: std.mem.Allocator,
     out: std.fs.File,
@@ -265,11 +289,15 @@ const Writer = struct {
     frag_entries: std.ArrayListUnmanaged(FragEntry) = .{},
     enc_buf: []u8,
     raw_buf: []u8,
+    dedup: Dedup,
+    dedup_map: std.AutoHashMapUnmanaged(u64, FileRecord) = .{},
     compressor: ?u16 = null,
     blocks_copied: u64 = 0,
     frags_copied: u64 = 0,
     blocks_raw: u64 = 0,
     blocks_sparse: u64 = 0,
+    files_deduped: u64 = 0,
+    bytes_deduped: u64 = 0,
 
     fn emit(w: *Writer, bytes: []const u8) !void {
         try w.out.writeAll(bytes);
@@ -323,12 +351,7 @@ const Writer = struct {
 
         // Fallback: store the decompressed data as an uncompressed block.
         const buf = w.raw_buf[0..span];
-        var got: usize = 0;
-        while (got < span) {
-            const n = try std.posix.pread(file.handle, buf[got..], off + got);
-            if (n == 0) return error.UnexpectedEof;
-            got += n;
-        }
+        try preadFull(file, buf, off);
         if (std.mem.allEqual(u8, buf, 0)) {
             w.blocks_sparse += 1;
             return 0; // sparse block
@@ -380,10 +403,40 @@ const Writer = struct {
         try iw.writeInt(u32, node.inum, .little);
     }
 
+    // A matching dedup key only nominates a candidate: confirm the two files
+    // would be stored identically by pread'ing the already-written copy back
+    // from the image and comparing bytes (no blocks are kept in memory).
+    fn sameAsRecord(w: *Writer, rec: FileRecord, range_begin: u64, frag_idx: u32, sizes: []const u32, size: u64) !bool {
+        if (rec.size != size) return false;
+        const len = w.pos - range_begin;
+        if (rec.range_end - rec.range_begin != len) return false;
+        if ((rec.frag_idx == 0xFFFFFFFF) != (frag_idx == 0xFFFFFFFF)) return false;
+        if (frag_idx != 0xFFFFFFFF and rec.frag_size != w.frag_entries.items[frag_idx].size) return false;
+        if (!std.mem.eql(u32, rec.sizes, sizes)) return false;
+        const half = w.enc_buf.len / 2;
+        var done: u64 = 0;
+        while (done < len) {
+            const n: usize = @intCast(@min(len - done, half));
+            const a = w.enc_buf[0..n];
+            const b = w.enc_buf[half..][0..n];
+            try preadFull(w.out, a, rec.range_begin + done);
+            try preadFull(w.out, b, range_begin + done);
+            if (!std.mem.eql(u8, a, b)) return false;
+            done += n;
+        }
+        return true;
+    }
+
     fn writeFile(w: *Writer, node: *Node, dirh: std.fs.Dir) !void {
         var file = try dirh.openFile(node.name, .{});
         defer file.close();
         const size = node.size;
+        const range_begin = w.pos;
+        const frags_begin = w.frag_entries.items.len;
+        const snap_copied = w.blocks_copied;
+        const snap_frags = w.frags_copied;
+        const snap_raw = w.blocks_raw;
+        const snap_sparse = w.blocks_sparse;
         const tail: u32 = @intCast(size % block_size);
         var frag_idx: u32 = 0xFFFFFFFF;
         if (tail != 0) {
@@ -392,8 +445,9 @@ const Writer = struct {
         const has_tail_block = tail != 0 and frag_idx == 0xFFFFFFFF;
         const n_blocks: usize = @intCast(size / block_size + @intFromBool(has_tail_block));
         const sizes = try w.alloc.alloc(u32, n_blocks);
-        defer w.alloc.free(sizes);
-        const start = w.pos;
+        var sizes_in_map = false;
+        defer if (!sizes_in_map) w.alloc.free(sizes);
+        var start = w.pos;
         var sparse_bytes: u64 = 0;
         for (sizes, 0..) |*s, i| {
             const off = @as(u64, @intCast(i)) * block_size;
@@ -401,6 +455,42 @@ const Writer = struct {
             s.* = try w.writeBlock(file, off, span);
             if (s.* == 0) sparse_bytes += span;
         }
+
+        // dedup: only worth it when the file wrote actual data
+        if (w.pos > range_begin) {
+            if (w.dedup.fileKey(file.handle, node.ino, size)) |key| {
+                const gop = try w.dedup_map.getOrPut(w.alloc, key);
+                if (gop.found_existing) {
+                    if (try w.sameAsRecord(gop.value_ptr.*, range_begin, frag_idx, sizes, size)) {
+                        // drop this copy and reference the first one
+                        w.files_deduped += 1;
+                        w.bytes_deduped += w.pos - range_begin;
+                        w.frag_entries.items.len = frags_begin;
+                        try w.out.seekTo(range_begin);
+                        try w.out.setEndPos(range_begin);
+                        w.pos = range_begin;
+                        w.blocks_copied = snap_copied;
+                        w.frags_copied = snap_frags;
+                        w.blocks_raw = snap_raw;
+                        w.blocks_sparse = snap_sparse;
+                        start = gop.value_ptr.start;
+                        frag_idx = gop.value_ptr.frag_idx;
+                    }
+                } else {
+                    gop.value_ptr.* = .{
+                        .size = size,
+                        .start = start,
+                        .range_begin = range_begin,
+                        .range_end = w.pos,
+                        .frag_idx = frag_idx,
+                        .frag_size = if (frag_idx != 0xFFFFFFFF) w.frag_entries.items[frag_idx].size else 0,
+                        .sizes = sizes,
+                    };
+                    sizes_in_map = true;
+                }
+            }
+        }
+
         const iw = w.inode_tab.writer(w.alloc);
         if (start > std.math.maxInt(u32) or size > std.math.maxInt(u32)) {
             // extended file inode: 64-bit start and size
@@ -621,14 +711,16 @@ pub fn main() !void {
     try builder.scan(src, root);
     builder.number(root);
 
-    // phase 2: write the image
-    const out = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
+    // phase 2: write the image (read access: dedup verifies candidates by
+    // reading the already-written copy back)
+    const out = try std.fs.cwd().createFile(out_path, .{ .truncate = true, .read = true });
     defer out.close();
     var w = Writer{
         .alloc = alloc,
         .out = out,
         .enc_buf = try alloc.alloc(u8, 2 * block_size),
         .raw_buf = try alloc.alloc(u8, block_size),
+        .dedup = try Dedup.init(alloc, src.fd),
     };
     try w.emit(&[_]u8{0} ** 96); // superblock placeholder
 
@@ -637,7 +729,7 @@ pub fn main() !void {
     const bytes_used = try w.finish(&builder, root);
 
     std.log.info(
-        "{d} inodes, {d} blocks + {d} tail fragments copied verbatim ({s}), {d} blocks stored raw, {d} sparse, {d} bytes",
+        "{d} inodes, {d} blocks + {d} tail fragments copied verbatim ({s}), {d} blocks stored raw, {d} sparse, {d} files deduped ({d} bytes), {d} bytes",
         .{
             builder.inode_count,
             w.blocks_copied,
@@ -645,6 +737,8 @@ pub fn main() !void {
             if ((w.compressor orelse SQFS_COMP_ZSTD) == SQFS_COMP_GZIP) "gzip" else "zstd",
             w.blocks_raw,
             w.blocks_sparse,
+            w.files_deduped,
+            w.bytes_deduped,
             bytes_used,
         },
     );
