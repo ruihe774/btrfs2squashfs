@@ -1,19 +1,33 @@
-// btrfs2squashfs: convert a directory on a zstd-compressed btrfs filesystem
-// into a squashfs v4 image WITHOUT recompressing file data.
+// btrfs2squashfs: convert a directory on a compressed btrfs filesystem into
+// a squashfs v4 image WITHOUT recompressing file data.
 //
-// How: btrfs transparent compression stores each 128 KiB chunk of a file as an
-// independent, standard zstd frame. squashfs (with the default 128 KiB block
-// size and zstd compressor) stores each 128 KiB block as an independent,
-// standard zstd frame. So the compressed bytes can be copied verbatim from
-// btrfs extents (read via BTRFS_IOC_ENCODED_READ) into squashfs data blocks.
+// How: btrfs transparent compression stores each 128 KiB chunk of a file as
+// an independent, standard zstd frame (or zlib stream). squashfs (with the
+// default 128 KiB block size) stores each 128 KiB block the same way. So the
+// compressed bytes can be copied verbatim from btrfs extents (read via
+// BTRFS_IOC_ENCODED_READ) into squashfs data blocks.
 //
-// Blocks that can't be copied verbatim (tail extents padded to sector size,
-// uncompressed/inline extents, misaligned extents) are stored as raw
+// A squashfs image has a single compressor, so it is locked to the algorithm
+// of the first extent copied verbatim (zstd -> zstd, zlib -> gzip); extents
+// of the other algorithm are then stored raw. btrfs lzo cannot be copied at
+// all: it is a segmented container format (per-page segments with length
+// headers), not the plain lzo1x stream squashfs expects.
+//
+// Tail ends whose extents decompress to more than the tail itself (btrfs
+// pads compression input to the sector size; inline extents decompress to a
+// full sector) are copied verbatim as squashfs fragment blocks: the inode
+// references only the first `tail` bytes of the fragment, so the padding is
+// never read. One fragment block per tail - packing several compressed tails
+// into one fragment block would require recompression, because a fragment
+// block is a single compression unit.
+//
+// Blocks that still can't be copied verbatim (uncompressed extents,
+// misaligned extents, foreign-compressor extents) are stored as raw
 // uncompressed squashfs blocks - still no recompression. All-zero blocks
 // become squashfs sparse blocks. Metadata tables are stored uncompressed.
 //
-// Limitations (POC): no xattrs, no hard-link dedup, basic inodes only
-// (files < 4 GiB, data region < 4 GiB, directory listings < 64 KiB).
+// Limitations (POC): no xattrs, no hard-link dedup, directory listings
+// < 64 KiB.
 //
 // Usage: sudo btrfs2squashfs <source-dir> <output.squashfs>
 // (BTRFS_IOC_ENCODED_READ requires CAP_SYS_ADMIN.)
@@ -41,7 +55,11 @@ const EncodedIoArgs = extern struct {
 };
 
 const BTRFS_IOC_ENCODED_READ = linux.IOCTL.IOR(0x94, 64, EncodedIoArgs);
+const BTRFS_ENCODED_IO_COMPRESSION_ZLIB: u32 = 1;
 const BTRFS_ENCODED_IO_COMPRESSION_ZSTD: u32 = 2;
+
+const SQFS_COMP_GZIP: u16 = 1;
+const SQFS_COMP_ZSTD: u16 = 6;
 
 const EncodedExtent = struct {
     encoded_len: usize,
@@ -233,15 +251,23 @@ fn metaOffsetOf(pos: usize) u16 {
     return @intCast(pos % meta_size);
 }
 
+const FragEntry = struct {
+    start: u64,
+    size: u32,
+};
+
 const Writer = struct {
     alloc: std.mem.Allocator,
     out: std.fs.File,
     pos: u64 = 0,
     inode_tab: std.ArrayListUnmanaged(u8) = .{},
     dir_tab: std.ArrayListUnmanaged(u8) = .{},
+    frag_entries: std.ArrayListUnmanaged(FragEntry) = .{},
     enc_buf: []u8,
     raw_buf: []u8,
+    compressor: ?u16 = null,
     blocks_copied: u64 = 0,
+    frags_copied: u64 = 0,
     blocks_raw: u64 = 0,
     blocks_sparse: u64 = 0,
 
@@ -250,23 +276,48 @@ const Writer = struct {
         w.pos += bytes.len;
     }
 
+    // The image has a single compressor; the first verbatim copy decides it.
+    fn lockCompressor(w: *Writer, comp: u16) bool {
+        if (w.compressor) |locked| return locked == comp;
+        w.compressor = comp;
+        return true;
+    }
+
     // Writes one squashfs data block for file range [off, off+span).
     // Returns the block-list entry.
     fn writeBlock(w: *Writer, file: std.fs.File, off: u64, span: u32) !u32 {
         const ext = try encodedRead(file.handle, off, w.enc_buf);
         // Verbatim copy is only valid if this extent is exactly the
-        // squashfs block: starts at `off`, covers `span` bytes, and its
-        // frame decompresses to exactly `span` bytes. The frame's own
-        // declared content size is the authority on the latter:
-        // unencoded_len understates it for sector-padded inline extents.
-        if (ext.compression == BTRFS_ENCODED_IO_COMPRESSION_ZSTD and
-            ext.len == span and ext.unencoded_len == span and ext.unencoded_offset == 0)
-        {
-            const frame = try zstdFrameParse(w.enc_buf[0..ext.encoded_len]);
-            if (frame.size < span and frame.content_size == span) {
-                try w.emit(w.enc_buf[0..frame.size]);
-                w.blocks_copied += 1;
-                return @intCast(frame.size);
+        // squashfs block: starts at `off`, covers `span` bytes, and
+        // decompresses to exactly `span` bytes.
+        if (ext.len == span and ext.unencoded_len == span and ext.unencoded_offset == 0) {
+            switch (ext.compression) {
+                BTRFS_ENCODED_IO_COMPRESSION_ZSTD => if (w.lockCompressor(SQFS_COMP_ZSTD)) {
+                    // The frame's declared content size is the authority on
+                    // the decompressed size: unencoded_len understates it for
+                    // sector-padded inline extents. squashfs zstd
+                    // decompressors also reject trailing garbage, so trim the
+                    // frame to its exact end.
+                    const frame = try zstdFrameParse(w.enc_buf[0..ext.encoded_len]);
+                    if (frame.size < span and frame.content_size == span) {
+                        try w.emit(w.enc_buf[0..frame.size]);
+                        w.blocks_copied += 1;
+                        return @intCast(frame.size);
+                    }
+                },
+                BTRFS_ENCODED_IO_COMPRESSION_ZLIB => if (w.lockCompressor(SQFS_COMP_GZIP)) {
+                    // No trimming needed: zlib decompressors (both the kernel
+                    // and squashfs-tools) stop at the stream end and ignore
+                    // the sector padding btrfs appends. For a non-inline
+                    // extent unencoded_len (ram_bytes) is the exact
+                    // decompressed size, and only small files are inlined.
+                    if (ext.encoded_len < span) {
+                        try w.emit(w.enc_buf[0..ext.encoded_len]);
+                        w.blocks_copied += 1;
+                        return @intCast(ext.encoded_len);
+                    }
+                },
+                else => {},
             }
         }
 
@@ -287,11 +338,41 @@ const Writer = struct {
         return 0x1000000 | span; // uncompressed-block flag
     }
 
-    fn inodeCommon(w: *Writer, node: *Node) !void {
+    // If the tail's extent decompresses to more than the tail itself (btrfs
+    // pads compression input to the sector size; inline extents decompress
+    // to a full sector), the frame can still be copied verbatim - as a
+    // fragment block. The inode references bytes [0, tail) of the fragment,
+    // so the padding is never read. Returns the fragment index, or null if
+    // the tail doesn't qualify (the caller stores it as a data block).
+    fn tryTailFragment(w: *Writer, file: std.fs.File, off: u64, tail: u32) !?u32 {
+        const ext = try encodedRead(file.handle, off, w.enc_buf);
+        if (ext.len != tail or ext.unencoded_offset != 0) return null;
+        const frame_size: usize = switch (ext.compression) {
+            BTRFS_ENCODED_IO_COMPRESSION_ZSTD => blk: {
+                if (!w.lockCompressor(SQFS_COMP_ZSTD)) return null;
+                const frame = zstdFrameParse(w.enc_buf[0..ext.encoded_len]) catch return null;
+                if (frame.content_size < tail or frame.content_size > block_size) return null;
+                break :blk frame.size;
+            },
+            BTRFS_ENCODED_IO_COMPRESSION_ZLIB => blk: {
+                if (!w.lockCompressor(SQFS_COMP_GZIP)) return null;
+                if (ext.unencoded_len > block_size) return null;
+                break :blk ext.encoded_len;
+            },
+            else => return null,
+        };
+        if (frame_size >= tail) return null; // a raw data block would be smaller
+        try w.frag_entries.append(w.alloc, .{ .start = w.pos, .size = @intCast(frame_size) });
+        try w.emit(w.enc_buf[0..frame_size]);
+        w.frags_copied += 1;
+        return @intCast(w.frag_entries.items.len - 1);
+    }
+
+    fn inodeCommon(w: *Writer, node: *Node, itype: u16) !void {
         const iw = w.inode_tab.writer(w.alloc);
         node.ref_block = metaBlockOf(w.inode_tab.items.len);
         node.ref_offset = metaOffsetOf(w.inode_tab.items.len);
-        try iw.writeInt(u16, @intFromEnum(node.kind), .little);
+        try iw.writeInt(u16, itype, .little);
         try iw.writeInt(u16, node.mode, .little);
         try iw.writeInt(u16, node.uid_idx, .little);
         try iw.writeInt(u16, node.gid_idx, .little);
@@ -303,29 +384,48 @@ const Writer = struct {
         var file = try dirh.openFile(node.name, .{});
         defer file.close();
         const size = node.size;
-        const n_blocks: usize = @intCast((size + block_size - 1) / block_size);
+        const tail: u32 = @intCast(size % block_size);
+        var frag_idx: u32 = 0xFFFFFFFF;
+        if (tail != 0) {
+            if (try w.tryTailFragment(file, size - tail, tail)) |idx| frag_idx = idx;
+        }
+        const has_tail_block = tail != 0 and frag_idx == 0xFFFFFFFF;
+        const n_blocks: usize = @intCast(size / block_size + @intFromBool(has_tail_block));
         const sizes = try w.alloc.alloc(u32, n_blocks);
         defer w.alloc.free(sizes);
         const start = w.pos;
+        var sparse_bytes: u64 = 0;
         for (sizes, 0..) |*s, i| {
             const off = @as(u64, @intCast(i)) * block_size;
-            s.* = try w.writeBlock(file, off, @intCast(@min(block_size, size - off)));
+            const span: u32 = @intCast(@min(block_size, size - off));
+            s.* = try w.writeBlock(file, off, span);
+            if (s.* == 0) sparse_bytes += span;
         }
-        if (start > std.math.maxInt(u32) or size > std.math.maxInt(u32))
-            return error.TooLargeForBasicInode;
-        try w.inodeCommon(node);
         const iw = w.inode_tab.writer(w.alloc);
-        try iw.writeInt(u32, if (size == 0) 0 else @intCast(start), .little);
-        try iw.writeInt(u32, 0xFFFFFFFF, .little); // no fragment
-        try iw.writeInt(u32, 0, .little); // fragment offset
-        try iw.writeInt(u32, @intCast(size), .little);
+        if (start > std.math.maxInt(u32) or size > std.math.maxInt(u32)) {
+            // extended file inode: 64-bit start and size
+            try w.inodeCommon(node, 9);
+            try iw.writeInt(u64, if (n_blocks == 0) 0 else start, .little);
+            try iw.writeInt(u64, size, .little);
+            try iw.writeInt(u64, sparse_bytes, .little);
+            try iw.writeInt(u32, 1, .little); // nlink
+            try iw.writeInt(u32, frag_idx, .little);
+            try iw.writeInt(u32, 0, .little); // fragment offset
+            try iw.writeInt(u32, 0xFFFFFFFF, .little); // no xattrs
+        } else {
+            try w.inodeCommon(node, @intFromEnum(node.kind));
+            try iw.writeInt(u32, if (n_blocks == 0) 0 else @intCast(start), .little);
+            try iw.writeInt(u32, frag_idx, .little);
+            try iw.writeInt(u32, 0, .little); // fragment offset
+            try iw.writeInt(u32, @intCast(size), .little);
+        }
         for (sizes) |s| try iw.writeInt(u32, s, .little);
     }
 
     fn writeSymlink(w: *Writer, node: *Node, dirh: std.fs.Dir) !void {
         var buf: [4096]u8 = undefined;
         const target = try dirh.readLink(node.name, &buf);
-        try w.inodeCommon(node);
+        try w.inodeCommon(node, @intFromEnum(node.kind));
         const iw = w.inode_tab.writer(w.alloc);
         try iw.writeInt(u32, 1, .little); // nlink
         try iw.writeInt(u32, @intCast(target.len), .little);
@@ -333,7 +433,7 @@ const Writer = struct {
     }
 
     fn writeSpecial(w: *Writer, node: *Node) !void {
-        try w.inodeCommon(node);
+        try w.inodeCommon(node, @intFromEnum(node.kind));
         const iw = w.inode_tab.writer(w.alloc);
         try iw.writeInt(u32, 1, .little); // nlink
         if (node.kind == .blkdev or node.kind == .chrdev)
@@ -385,7 +485,7 @@ const Writer = struct {
         const list_len = w.dir_tab.items.len - list_start;
         if (list_len + 3 > 0xFFFF) return error.DirTooLargeForBasicInode;
 
-        try w.inodeCommon(node);
+        try w.inodeCommon(node, @intFromEnum(node.kind));
         const iw = w.inode_tab.writer(w.alloc);
         try iw.writeInt(u32, list_block, .little);
         try iw.writeInt(u32, 2 + n_subdirs, .little); // nlink
@@ -407,38 +507,53 @@ const Writer = struct {
         }
     }
 
-    // Emits the metadata/id tables, pads to 4 KiB, and back-patches the
-    // superblock. Returns the total image size (bytes_used).
+    // metadata block(s) of table entries, then an index of u64 offsets to
+    // each block. Returns the index start (what the superblock points at).
+    fn emitIndexedTable(w: *Writer, data: []const u8) !u64 {
+        var block_offsets = std.ArrayListUnmanaged(u64){};
+        defer block_offsets.deinit(w.alloc);
+        var p: usize = 0;
+        while (p < data.len) {
+            try block_offsets.append(w.alloc, w.pos);
+            const n: usize = @min(meta_size, data.len - p);
+            var hdr: [2]u8 = undefined;
+            std.mem.writeInt(u16, &hdr, @intCast(0x8000 | n), .little);
+            try w.emit(&hdr);
+            try w.emit(data[p .. p + n]);
+            p += n;
+        }
+        const index_start = w.pos;
+        for (block_offsets.items) |off| {
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, off, .little);
+            try w.emit(&b);
+        }
+        return index_start;
+    }
+
+    // Emits the metadata/fragment/id tables, pads to 4 KiB, and back-patches
+    // the superblock. Returns the total image size (bytes_used).
     fn finish(w: *Writer, builder: *Builder, root: *Node) !u64 {
         const inode_table_start = w.pos;
         try w.emitMetaTable(w.inode_tab.items);
         const directory_table_start = w.pos;
         try w.emitMetaTable(w.dir_tab.items);
-        const fragment_table_start = w.pos; // zero fragments; never dereferenced
 
-        // id table: metadata block(s) of u32 ids, then index of u64 block offsets
+        var frag_bytes = std.ArrayListUnmanaged(u8){};
+        defer frag_bytes.deinit(w.alloc);
+        const fw = frag_bytes.writer(w.alloc);
+        for (w.frag_entries.items) |e| {
+            try fw.writeInt(u64, e.start, .little);
+            try fw.writeInt(u32, e.size, .little); // compressed: bit 24 clear
+            try fw.writeInt(u32, 0, .little); // unused
+        }
+        const fragment_table_start = try w.emitIndexedTable(frag_bytes.items);
+
         const ids = builder.ids.keys();
         var id_bytes = std.ArrayListUnmanaged(u8){};
+        defer id_bytes.deinit(w.alloc);
         for (ids) |id| try id_bytes.writer(w.alloc).writeInt(u32, id, .little);
-        var id_block_offsets = std.ArrayListUnmanaged(u64){};
-        {
-            var p: usize = 0;
-            while (p < id_bytes.items.len) {
-                try id_block_offsets.append(w.alloc, w.pos);
-                const n: usize = @min(meta_size, id_bytes.items.len - p);
-                var hdr: [2]u8 = undefined;
-                std.mem.writeInt(u16, &hdr, @intCast(0x8000 | n), .little);
-                try w.emit(&hdr);
-                try w.emit(id_bytes.items[p .. p + n]);
-                p += n;
-            }
-        }
-        const id_table_start = w.pos;
-        for (id_block_offsets.items) |off| {
-            var b: [8]u8 = undefined;
-            std.mem.writeInt(u64, &b, off, .little);
-            try w.emit(&b);
-        }
+        const id_table_start = try w.emitIndexedTable(id_bytes.items);
 
         const bytes_used = w.pos;
         // pad to 4 KiB
@@ -456,10 +571,12 @@ const Writer = struct {
         try sw.writeInt(u32, builder.inode_count, .little);
         try sw.writeInt(u32, std.math.lossyCast(u32, std.time.timestamp()), .little);
         try sw.writeInt(u32, block_size, .little);
-        try sw.writeInt(u32, 0, .little); // fragment count
-        try sw.writeInt(u16, 6, .little); // compressor: zstd
+        try sw.writeInt(u32, @intCast(w.frag_entries.items.len), .little);
+        try sw.writeInt(u16, w.compressor orelse SQFS_COMP_ZSTD, .little);
         try sw.writeInt(u16, block_log, .little);
-        try sw.writeInt(u16, 0x0811, .little); // NOI | NO_FRAG | NOID
+        // NOI | NOID, plus NO_FRAG when no fragments were written
+        const no_frag: u16 = if (w.frag_entries.items.len == 0) 0x0010 else 0;
+        try sw.writeInt(u16, 0x0801 | no_frag, .little);
         try sw.writeInt(u16, @intCast(ids.len), .little);
         try sw.writeInt(u16, 4, .little); // version major
         try sw.writeInt(u16, 0, .little); // version minor
@@ -520,7 +637,15 @@ pub fn main() !void {
     const bytes_used = try w.finish(&builder, root);
 
     std.log.info(
-        "{d} inodes, {d} blocks copied verbatim (zstd), {d} stored raw, {d} sparse, {d} bytes",
-        .{ builder.inode_count, w.blocks_copied, w.blocks_raw, w.blocks_sparse, bytes_used },
+        "{d} inodes, {d} blocks + {d} tail fragments copied verbatim ({s}), {d} blocks stored raw, {d} sparse, {d} bytes",
+        .{
+            builder.inode_count,
+            w.blocks_copied,
+            w.frags_copied,
+            if ((w.compressor orelse SQFS_COMP_ZSTD) == SQFS_COMP_GZIP) "gzip" else "zstd",
+            w.blocks_raw,
+            w.blocks_sparse,
+            bytes_used,
+        },
     );
 }
