@@ -406,6 +406,75 @@ const Writer = struct {
             p += n;
         }
     }
+
+    // Emits the metadata/id tables, pads to 4 KiB, and back-patches the
+    // superblock. Returns the total image size (bytes_used).
+    fn finish(w: *Writer, builder: *Builder, root: *Node) !u64 {
+        const inode_table_start = w.pos;
+        try w.emitMetaTable(w.inode_tab.items);
+        const directory_table_start = w.pos;
+        try w.emitMetaTable(w.dir_tab.items);
+        const fragment_table_start = w.pos; // zero fragments; never dereferenced
+
+        // id table: metadata block(s) of u32 ids, then index of u64 block offsets
+        const ids = builder.ids.keys();
+        var id_bytes = std.ArrayListUnmanaged(u8){};
+        for (ids) |id| try id_bytes.writer(w.alloc).writeInt(u32, id, .little);
+        var id_block_offsets = std.ArrayListUnmanaged(u64){};
+        {
+            var p: usize = 0;
+            while (p < id_bytes.items.len) {
+                try id_block_offsets.append(w.alloc, w.pos);
+                const n: usize = @min(meta_size, id_bytes.items.len - p);
+                var hdr: [2]u8 = undefined;
+                std.mem.writeInt(u16, &hdr, @intCast(0x8000 | n), .little);
+                try w.emit(&hdr);
+                try w.emit(id_bytes.items[p .. p + n]);
+                p += n;
+            }
+        }
+        const id_table_start = w.pos;
+        for (id_block_offsets.items) |off| {
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, off, .little);
+            try w.emit(&b);
+        }
+
+        const bytes_used = w.pos;
+        // pad to 4 KiB
+        const pad = (4096 - bytes_used % 4096) % 4096;
+        if (pad > 0) {
+            const zeros = [_]u8{0} ** 4096;
+            try w.emit(zeros[0..pad]);
+        }
+
+        // superblock
+        var sb: [96]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&sb);
+        const sw = fbs.writer();
+        try sw.writeInt(u32, 0x73717368, .little); // magic "hsqs"
+        try sw.writeInt(u32, builder.inode_count, .little);
+        try sw.writeInt(u32, std.math.lossyCast(u32, std.time.timestamp()), .little);
+        try sw.writeInt(u32, block_size, .little);
+        try sw.writeInt(u32, 0, .little); // fragment count
+        try sw.writeInt(u16, 6, .little); // compressor: zstd
+        try sw.writeInt(u16, block_log, .little);
+        try sw.writeInt(u16, 0x0811, .little); // NOI | NO_FRAG | NOID
+        try sw.writeInt(u16, @intCast(ids.len), .little);
+        try sw.writeInt(u16, 4, .little); // version major
+        try sw.writeInt(u16, 0, .little); // version minor
+        try sw.writeInt(u64, (@as(u64, root.ref_block) << 16) | root.ref_offset, .little);
+        try sw.writeInt(u64, bytes_used, .little);
+        try sw.writeInt(u64, id_table_start, .little);
+        try sw.writeInt(u64, 0xFFFFFFFFFFFFFFFF, .little); // xattr table
+        try sw.writeInt(u64, inode_table_start, .little);
+        try sw.writeInt(u64, directory_table_start, .little);
+        try sw.writeInt(u64, fragment_table_start, .little);
+        try sw.writeInt(u64, 0xFFFFFFFFFFFFFFFF, .little); // export table
+        try w.out.pwriteAll(&sb, 0);
+
+        return bytes_used;
+    }
 };
 
 pub fn main() !void {
@@ -448,68 +517,7 @@ pub fn main() !void {
 
     try w.writeDir(root, src, builder.inode_count + 1);
 
-    const inode_table_start = w.pos;
-    try w.emitMetaTable(w.inode_tab.items);
-    const directory_table_start = w.pos;
-    try w.emitMetaTable(w.dir_tab.items);
-    const fragment_table_start = w.pos; // zero fragments; never dereferenced
-
-    // id table: metadata block(s) of u32 ids, then index of u64 block offsets
-    const ids = builder.ids.keys();
-    var id_bytes = std.ArrayListUnmanaged(u8){};
-    for (ids) |id| try id_bytes.writer(alloc).writeInt(u32, id, .little);
-    var id_block_offsets = std.ArrayListUnmanaged(u64){};
-    {
-        var p: usize = 0;
-        while (p < id_bytes.items.len) {
-            try id_block_offsets.append(alloc, w.pos);
-            const n: usize = @min(meta_size, id_bytes.items.len - p);
-            var hdr: [2]u8 = undefined;
-            std.mem.writeInt(u16, &hdr, @intCast(0x8000 | n), .little);
-            try w.emit(&hdr);
-            try w.emit(id_bytes.items[p .. p + n]);
-            p += n;
-        }
-    }
-    const id_table_start = w.pos;
-    for (id_block_offsets.items) |off| {
-        var b: [8]u8 = undefined;
-        std.mem.writeInt(u64, &b, off, .little);
-        try w.emit(&b);
-    }
-
-    const bytes_used = w.pos;
-    // pad to 4 KiB
-    const pad = (4096 - bytes_used % 4096) % 4096;
-    if (pad > 0) {
-        const zeros = [_]u8{0} ** 4096;
-        try w.emit(zeros[0..pad]);
-    }
-
-    // superblock
-    var sb: [96]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&sb);
-    const sw = fbs.writer();
-    try sw.writeInt(u32, 0x73717368, .little); // magic "hsqs"
-    try sw.writeInt(u32, builder.inode_count, .little);
-    try sw.writeInt(u32, std.math.lossyCast(u32, std.time.timestamp()), .little);
-    try sw.writeInt(u32, block_size, .little);
-    try sw.writeInt(u32, 0, .little); // fragment count
-    try sw.writeInt(u16, 6, .little); // compressor: zstd
-    try sw.writeInt(u16, block_log, .little);
-    try sw.writeInt(u16, 0x0811, .little); // NOI | NO_FRAG | NOID
-    try sw.writeInt(u16, @intCast(ids.len), .little);
-    try sw.writeInt(u16, 4, .little); // version major
-    try sw.writeInt(u16, 0, .little); // version minor
-    try sw.writeInt(u64, (@as(u64, root.ref_block) << 16) | root.ref_offset, .little);
-    try sw.writeInt(u64, bytes_used, .little);
-    try sw.writeInt(u64, id_table_start, .little);
-    try sw.writeInt(u64, 0xFFFFFFFFFFFFFFFF, .little); // xattr table
-    try sw.writeInt(u64, inode_table_start, .little);
-    try sw.writeInt(u64, directory_table_start, .little);
-    try sw.writeInt(u64, fragment_table_start, .little);
-    try sw.writeInt(u64, 0xFFFFFFFFFFFFFFFF, .little); // export table
-    try out.pwriteAll(&sb, 0);
+    const bytes_used = try w.finish(&builder, root);
 
     std.log.info(
         "{d} inodes, {d} blocks copied verbatim (zstd), {d} stored raw, {d} sparse, {d} bytes",
