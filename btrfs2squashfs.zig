@@ -94,18 +94,8 @@ fn zstdFrameParse(buf: []const u8) !ZstdFrame {
     pos += 1;
     const single_segment = (fhd & 0x20) != 0;
     if (!single_segment) pos += 1; // window descriptor
-    pos += switch (@as(u2, @truncate(fhd))) { // dictionary id
-        0 => 0,
-        1 => 1,
-        2 => 2,
-        3 => 4,
-    };
-    const fcs_len: usize = switch (@as(u2, @truncate(fhd >> 6))) {
-        0 => if (single_segment) 1 else 0,
-        1 => 2,
-        2 => 4,
-        3 => 8,
-    };
+    pos += @as(usize, 1) << @as(u2, @truncate(fhd)) >> 1; // dictionary id
+    const fcs_len: usize = (@as(usize, 1) << @as(u2, @truncate(fhd >> 6))) & ~@as(usize, @intFromBool(!single_segment));
     if (pos + fcs_len > buf.len) return error.Truncated;
     const content_size: u64 = switch (fcs_len) {
         0 => 0,
@@ -220,7 +210,7 @@ const Builder = struct {
                 try b.scan(sub, child);
             }
         }
-        std.mem.sort(*Node, node.children.items, {}, struct {
+        std.mem.sortUnstable(*Node, node.children.items, {}, struct {
             fn lt(_: void, a: *Node, c: *Node) bool {
                 return std.mem.order(u8, a.name, c.name) == .lt;
             }
@@ -251,7 +241,6 @@ const Writer = struct {
     dir_tab: std.ArrayListUnmanaged(u8) = .{},
     enc_buf: []u8,
     raw_buf: []u8,
-    encoded_disabled: bool = false,
     blocks_copied: u64 = 0,
     blocks_raw: u64 = 0,
     blocks_sparse: u64 = 0,
@@ -264,32 +253,23 @@ const Writer = struct {
     // Writes one squashfs data block for file range [off, off+span).
     // Returns the block-list entry.
     fn writeBlock(w: *Writer, file: std.fs.File, off: u64, span: u32) !u32 {
-        if (!w.encoded_disabled) blk: {
-            const ext = encodedRead(file.handle, off, w.enc_buf) catch |err| switch (err) {
-                error.NeedCapSysAdmin => return err,
-                error.EncodedReadUnsupported => {
-                    std.log.warn("encoded read unsupported; storing all data uncompressed", .{});
-                    w.encoded_disabled = true;
-                    break :blk;
-                },
-                else => return err,
-            };
-            // Verbatim copy is only valid if this extent is exactly the
-            // squashfs block: starts at `off`, covers `span` bytes, and its
-            // frame decompresses to exactly `span` bytes. The frame's own
-            // declared content size is the authority on the latter:
-            // unencoded_len understates it for sector-padded inline extents.
-            if (ext.compression == BTRFS_ENCODED_IO_COMPRESSION_ZSTD and
-                ext.len == span and ext.unencoded_len == span and ext.unencoded_offset == 0)
-            {
-                const frame = zstdFrameParse(w.enc_buf[0..ext.encoded_len]) catch break :blk;
-                if (frame.size < span and frame.content_size == span) {
-                    try w.emit(w.enc_buf[0..frame.size]);
-                    w.blocks_copied += 1;
-                    return @intCast(frame.size);
-                }
+        const ext = try encodedRead(file.handle, off, w.enc_buf);
+        // Verbatim copy is only valid if this extent is exactly the
+        // squashfs block: starts at `off`, covers `span` bytes, and its
+        // frame decompresses to exactly `span` bytes. The frame's own
+        // declared content size is the authority on the latter:
+        // unencoded_len understates it for sector-padded inline extents.
+        if (ext.compression == BTRFS_ENCODED_IO_COMPRESSION_ZSTD and
+            ext.len == span and ext.unencoded_len == span and ext.unencoded_offset == 0)
+        {
+            const frame = try zstdFrameParse(w.enc_buf[0..ext.encoded_len]);
+            if (frame.size < span and frame.content_size == span) {
+                try w.emit(w.enc_buf[0..frame.size]);
+                w.blocks_copied += 1;
+                return @intCast(frame.size);
             }
         }
+
         // Fallback: store the decompressed data as an uncompressed block.
         const buf = w.raw_buf[0..span];
         var got: usize = 0;
@@ -431,15 +411,23 @@ const Writer = struct {
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
-    const args = try std.process.argsAlloc(alloc);
-    if (args.len != 3) {
-        std.log.err("usage: {s} <source-dir> <output.squashfs>", .{args[0]});
+    var args = std.process.args();
+    const arg0 = args.next();
+    const arg1 = args.next();
+    const arg2 = args.next();
+    var src_path: [:0]const u8 = undefined;
+    var out_path: [:0]const u8 = undefined;
+    if (arg2 == null) {
+        std.log.err("usage: {s} <source-dir> <output.squashfs>", .{arg0 orelse "btrfs2squashfs"});
         return error.Usage;
+    } else {
+        src_path = arg1.?;
+        out_path = arg2.?;
     }
 
     // phase 1: scan the tree
     var builder = Builder{ .alloc = alloc };
-    var src = try std.fs.cwd().openDir(args[1], .{ .iterate = true });
+    var src = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
     defer src.close();
     const root_st = try std.posix.fstat(src.fd);
     const root = try builder.nodeFromStat("", root_st);
@@ -448,7 +436,7 @@ pub fn main() !void {
     builder.number(root);
 
     // phase 2: write the image
-    const out = try std.fs.cwd().createFile(args[2], .{ .truncate = true });
+    const out = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
     defer out.close();
     var w = Writer{
         .alloc = alloc,
