@@ -29,8 +29,9 @@
 // Duplicate files (including hard links) are stored once: candidates are
 // found by hashing the per-sector checksums btrfs already keeps in its csum
 // tree (read via BTRFS_IOC_TREE_SEARCH_V2 - no checksum is computed here),
-// then confirmed by pread'ing the already-written copy back from the image
-// and comparing bytes, so no data blocks are kept in memory.
+// then confirmed - before the duplicate writes anything - by producing its
+// blocks and comparing them with the earlier copy, pread back from the
+// image, so no data blocks are kept in memory.
 //
 // Limitations (POC): no xattrs, directory listings < 64 KiB.
 //
@@ -311,9 +312,16 @@ const Writer = struct {
         return true;
     }
 
-    // Writes one squashfs data block for file range [off, off+span).
-    // Returns the block-list entry.
-    fn writeBlock(w: *Writer, file: std.fs.File, off: u64, span: u32) !u32 {
+    const Block = struct {
+        entry: u32, // block-list entry
+        bytes: []const u8, // points into enc_buf or raw_buf; empty for sparse
+        kind: enum { copied, raw, sparse },
+    };
+
+    // Produces the squashfs data block for file range [off, off+span)
+    // without writing anything (dedup verification produces blocks just to
+    // compare them against an already-written copy).
+    fn produceBlock(w: *Writer, file: std.fs.File, off: u64, span: u32) !Block {
         const ext = try encodedRead(file.handle, off, w.enc_buf);
         // Verbatim copy is only valid if this extent is exactly the
         // squashfs block: starts at `off`, covers `span` bytes, and
@@ -327,11 +335,8 @@ const Writer = struct {
                     // decompressors also reject trailing garbage, so trim the
                     // frame to its exact end.
                     const frame = try zstdFrameParse(w.enc_buf[0..ext.encoded_len]);
-                    if (frame.size < span and frame.content_size == span) {
-                        try w.emit(w.enc_buf[0..frame.size]);
-                        w.blocks_copied += 1;
-                        return @intCast(frame.size);
-                    }
+                    if (frame.size < span and frame.content_size == span)
+                        return .{ .entry = @intCast(frame.size), .bytes = w.enc_buf[0..frame.size], .kind = .copied };
                 },
                 BTRFS_ENCODED_IO_COMPRESSION_ZLIB => if (w.lockCompressor(SQFS_COMP_GZIP)) {
                     // No trimming needed: zlib decompressors (both the kernel
@@ -339,11 +344,8 @@ const Writer = struct {
                     // the sector padding btrfs appends. For a non-inline
                     // extent unencoded_len (ram_bytes) is the exact
                     // decompressed size, and only small files are inlined.
-                    if (ext.encoded_len < span) {
-                        try w.emit(w.enc_buf[0..ext.encoded_len]);
-                        w.blocks_copied += 1;
-                        return @intCast(ext.encoded_len);
-                    }
+                    if (ext.encoded_len < span)
+                        return .{ .entry = @intCast(ext.encoded_len), .bytes = w.enc_buf[0..ext.encoded_len], .kind = .copied };
                 },
                 else => {},
             }
@@ -352,22 +354,32 @@ const Writer = struct {
         // Fallback: store the decompressed data as an uncompressed block.
         const buf = w.raw_buf[0..span];
         try preadFull(file, buf, off);
-        if (std.mem.allEqual(u8, buf, 0)) {
-            w.blocks_sparse += 1;
-            return 0; // sparse block
+        if (std.mem.allEqual(u8, buf, 0))
+            return .{ .entry = 0, .bytes = buf[0..0], .kind = .sparse };
+        return .{ .entry = 0x1000000 | span, .bytes = buf, .kind = .raw }; // uncompressed-block flag
+    }
+
+    // Writes one squashfs data block for file range [off, off+span).
+    // Returns the block-list entry.
+    fn writeBlock(w: *Writer, file: std.fs.File, off: u64, span: u32) !u32 {
+        const blk = try w.produceBlock(file, off, span);
+        try w.emit(blk.bytes);
+        switch (blk.kind) {
+            .copied => w.blocks_copied += 1,
+            .raw => w.blocks_raw += 1,
+            .sparse => w.blocks_sparse += 1,
         }
-        try w.emit(buf);
-        w.blocks_raw += 1;
-        return 0x1000000 | span; // uncompressed-block flag
+        return blk.entry;
     }
 
     // If the tail's extent decompresses to more than the tail itself (btrfs
     // pads compression input to the sector size; inline extents decompress
     // to a full sector), the frame can still be copied verbatim - as a
     // fragment block. The inode references bytes [0, tail) of the fragment,
-    // so the padding is never read. Returns the fragment index, or null if
-    // the tail doesn't qualify (the caller stores it as a data block).
-    fn tryTailFragment(w: *Writer, file: std.fs.File, off: u64, tail: u32) !?u32 {
+    // so the padding is never read. Produces the frame in enc_buf and
+    // returns its size without writing anything, or null if the tail
+    // doesn't qualify (the caller stores it as a data block).
+    fn produceTailFragment(w: *Writer, file: std.fs.File, off: u64, tail: u32) !?usize {
         const ext = try encodedRead(file.handle, off, w.enc_buf);
         if (ext.len != tail or ext.unencoded_offset != 0) return null;
         const frame_size: usize = switch (ext.compression) {
@@ -385,10 +397,7 @@ const Writer = struct {
             else => return null,
         };
         if (frame_size >= tail) return null; // a raw data block would be smaller
-        try w.frag_entries.append(w.alloc, .{ .start = w.pos, .size = @intCast(frame_size) });
-        try w.emit(w.enc_buf[0..frame_size]);
-        w.frags_copied += 1;
-        return @intCast(w.frag_entries.items.len - 1);
+        return frame_size;
     }
 
     fn inodeCommon(w: *Writer, node: *Node, itype: u16) !void {
@@ -403,99 +412,53 @@ const Writer = struct {
         try iw.writeInt(u32, node.inum, .little);
     }
 
-    // A matching dedup key only nominates a candidate: confirm the two files
-    // would be stored identically by pread'ing the already-written copy back
-    // from the image and comparing bytes (no blocks are kept in memory).
-    fn sameAsRecord(w: *Writer, rec: FileRecord, range_begin: u64, frag_idx: u32, sizes: []const u32, size: u64) !bool {
-        if (rec.size != size) return false;
-        const len = w.pos - range_begin;
-        if (rec.range_end - rec.range_begin != len) return false;
-        if ((rec.frag_idx == 0xFFFFFFFF) != (frag_idx == 0xFFFFFFFF)) return false;
-        if (frag_idx != 0xFFFFFFFF and rec.frag_size != w.frag_entries.items[frag_idx].size) return false;
-        if (!std.mem.eql(u32, rec.sizes, sizes)) return false;
-        const half = w.enc_buf.len / 2;
-        var done: u64 = 0;
-        while (done < len) {
-            const n: usize = @intCast(@min(len - done, half));
-            const a = w.enc_buf[0..n];
-            const b = w.enc_buf[half..][0..n];
-            try preadFull(w.out, a, rec.range_begin + done);
-            try preadFull(w.out, b, range_begin + done);
-            if (!std.mem.eql(u8, a, b)) return false;
-            done += n;
-        }
-        return true;
+    // Byte-compares a produced block (in enc_buf's first half or raw_buf)
+    // against the image at `off`, using enc_buf's second half as the read
+    // buffer.
+    fn sameAsImage(w: *Writer, bytes: []const u8, off: u64) !bool {
+        if (bytes.len == 0) return true;
+        const other = w.enc_buf[w.enc_buf.len / 2 ..][0..bytes.len];
+        try preadFull(w.out, other, off);
+        return std.mem.eql(u8, bytes, other);
     }
 
-    fn writeFile(w: *Writer, node: *Node, dirh: std.fs.Dir) !void {
-        var file = try dirh.openFile(node.name, .{});
-        defer file.close();
-        const size = node.size;
-        const range_begin = w.pos;
-        const frags_begin = w.frag_entries.items.len;
-        const snap_copied = w.blocks_copied;
-        const snap_frags = w.frags_copied;
-        const snap_raw = w.blocks_raw;
-        const snap_sparse = w.blocks_sparse;
-        const tail: u32 = @intCast(size % block_size);
-        var frag_idx: u32 = 0xFFFFFFFF;
+    // A matching dedup key only nominates a candidate: confirm it by
+    // producing every block this file would write and comparing it with the
+    // candidate's copy, pread back from the image - before anything is
+    // written, and without keeping blocks in memory.
+    fn matchesRecord(w: *Writer, file: std.fs.File, rec: FileRecord, size: u64, tail: u32) !bool {
+        if (rec.size != size) return false;
+        var cursor = rec.range_begin;
+        var has_frag = false;
         if (tail != 0) {
-            if (try w.tryTailFragment(file, size - tail, tail)) |idx| frag_idx = idx;
-        }
-        const has_tail_block = tail != 0 and frag_idx == 0xFFFFFFFF;
-        const n_blocks: usize = @intCast(size / block_size + @intFromBool(has_tail_block));
-        const sizes = try w.alloc.alloc(u32, n_blocks);
-        var sizes_in_map = false;
-        defer if (!sizes_in_map) w.alloc.free(sizes);
-        var start = w.pos;
-        var sparse_bytes: u64 = 0;
-        for (sizes, 0..) |*s, i| {
-            const off = @as(u64, @intCast(i)) * block_size;
-            const span: u32 = @intCast(@min(block_size, size - off));
-            s.* = try w.writeBlock(file, off, span);
-            if (s.* == 0) sparse_bytes += span;
-        }
-
-        // dedup: only worth it when the file wrote actual data
-        if (w.pos > range_begin) {
-            if (w.dedup.fileKey(file.handle, node.ino, size)) |key| {
-                const gop = try w.dedup_map.getOrPut(w.alloc, key);
-                if (gop.found_existing) {
-                    if (try w.sameAsRecord(gop.value_ptr.*, range_begin, frag_idx, sizes, size)) {
-                        // drop this copy and reference the first one
-                        w.files_deduped += 1;
-                        w.bytes_deduped += w.pos - range_begin;
-                        w.frag_entries.items.len = frags_begin;
-                        try w.out.seekTo(range_begin);
-                        try w.out.setEndPos(range_begin);
-                        w.pos = range_begin;
-                        w.blocks_copied = snap_copied;
-                        w.frags_copied = snap_frags;
-                        w.blocks_raw = snap_raw;
-                        w.blocks_sparse = snap_sparse;
-                        start = gop.value_ptr.start;
-                        frag_idx = gop.value_ptr.frag_idx;
-                    }
-                } else {
-                    gop.value_ptr.* = .{
-                        .size = size,
-                        .start = start,
-                        .range_begin = range_begin,
-                        .range_end = w.pos,
-                        .frag_idx = frag_idx,
-                        .frag_size = if (frag_idx != 0xFFFFFFFF) w.frag_entries.items[frag_idx].size else 0,
-                        .sizes = sizes,
-                    };
-                    sizes_in_map = true;
-                }
+            if (try w.produceTailFragment(file, size - tail, tail)) |frame_size| {
+                has_frag = true;
+                if (rec.frag_idx == 0xFFFFFFFF or rec.frag_size != frame_size) return false;
+                if (!try w.sameAsImage(w.enc_buf[0..frame_size], cursor)) return false;
+                cursor += frame_size;
             }
         }
+        if (has_frag != (rec.frag_idx != 0xFFFFFFFF)) return false;
+        const has_tail_block = tail != 0 and !has_frag;
+        if (rec.sizes.len != size / block_size + @intFromBool(has_tail_block)) return false;
+        for (rec.sizes, 0..) |entry, i| {
+            const off = @as(u64, @intCast(i)) * block_size;
+            const span: u32 = @intCast(@min(block_size, size - off));
+            const blk = try w.produceBlock(file, off, span);
+            if (blk.entry != entry) return false;
+            if (!try w.sameAsImage(blk.bytes, cursor)) return false;
+            cursor += blk.bytes.len;
+        }
+        return cursor == rec.range_end;
+    }
 
+    fn writeFileInode(w: *Writer, node: *Node, start: u64, sparse_bytes: u64, frag_idx: u32, sizes: []const u32) !void {
+        const size = node.size;
         const iw = w.inode_tab.writer(w.alloc);
         if (start > std.math.maxInt(u32) or size > std.math.maxInt(u32)) {
             // extended file inode: 64-bit start and size
             try w.inodeCommon(node, 9);
-            try iw.writeInt(u64, if (n_blocks == 0) 0 else start, .little);
+            try iw.writeInt(u64, if (sizes.len == 0) 0 else start, .little);
             try iw.writeInt(u64, size, .little);
             try iw.writeInt(u64, sparse_bytes, .little);
             try iw.writeInt(u32, 1, .little); // nlink
@@ -504,12 +467,81 @@ const Writer = struct {
             try iw.writeInt(u32, 0xFFFFFFFF, .little); // no xattrs
         } else {
             try w.inodeCommon(node, @intFromEnum(node.kind));
-            try iw.writeInt(u32, if (n_blocks == 0) 0 else @intCast(start), .little);
+            try iw.writeInt(u32, if (sizes.len == 0) 0 else @intCast(start), .little);
             try iw.writeInt(u32, frag_idx, .little);
             try iw.writeInt(u32, 0, .little); // fragment offset
             try iw.writeInt(u32, @intCast(size), .little);
         }
         for (sizes) |s| try iw.writeInt(u32, s, .little);
+    }
+
+    fn writeFile(w: *Writer, node: *Node, dirh: std.fs.Dir) !void {
+        var file = try dirh.openFile(node.name, .{});
+        defer file.close();
+        const size = node.size;
+        const tail: u32 = @intCast(size % block_size);
+
+        // dedup: the btrfs csum-tree key nominates an already-written file;
+        // on a confirmed match nothing is written and the inode just
+        // references the earlier copy. A failed match (key collision) falls
+        // through to the normal write path.
+        const key = w.dedup.fileKey(file.handle, node.ino, size);
+        if (key) |k| if (w.dedup_map.get(k)) |rec| {
+            if (try w.matchesRecord(file, rec, size, tail)) {
+                w.files_deduped += 1;
+                w.bytes_deduped += rec.range_end - rec.range_begin;
+                var sparse_bytes: u64 = 0;
+                for (rec.sizes, 0..) |s, i| {
+                    const off = @as(u64, @intCast(i)) * block_size;
+                    if (s == 0) sparse_bytes += @min(block_size, size - off);
+                }
+                return w.writeFileInode(node, rec.start, sparse_bytes, rec.frag_idx, rec.sizes);
+            }
+        };
+
+        const range_begin = w.pos;
+        var frag_idx: u32 = 0xFFFFFFFF;
+        if (tail != 0) {
+            if (try w.produceTailFragment(file, size - tail, tail)) |frame_size| {
+                frag_idx = @intCast(w.frag_entries.items.len);
+                try w.frag_entries.append(w.alloc, .{ .start = w.pos, .size = @intCast(frame_size) });
+                try w.emit(w.enc_buf[0..frame_size]);
+                w.frags_copied += 1;
+            }
+        }
+        const has_tail_block = tail != 0 and frag_idx == 0xFFFFFFFF;
+        const n_blocks: usize = @intCast(size / block_size + @intFromBool(has_tail_block));
+        const sizes = try w.alloc.alloc(u32, n_blocks);
+        var sizes_in_map = false;
+        defer if (!sizes_in_map) w.alloc.free(sizes);
+        const start = w.pos;
+        var sparse_bytes: u64 = 0;
+        for (sizes, 0..) |*s, i| {
+            const off = @as(u64, @intCast(i)) * block_size;
+            const span: u32 = @intCast(@min(block_size, size - off));
+            s.* = try w.writeBlock(file, off, span);
+            if (s.* == 0) sparse_bytes += span;
+        }
+
+        // record this file for later duplicates (only worth it when it
+        // wrote actual data); on a key collision keep the first record
+        if (key != null and w.pos > range_begin) {
+            const gop = try w.dedup_map.getOrPut(w.alloc, key.?);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{
+                    .size = size,
+                    .start = start,
+                    .range_begin = range_begin,
+                    .range_end = w.pos,
+                    .frag_idx = frag_idx,
+                    .frag_size = if (frag_idx != 0xFFFFFFFF) w.frag_entries.items[frag_idx].size else 0,
+                    .sizes = sizes,
+                };
+                sizes_in_map = true;
+            }
+        }
+
+        try w.writeFileInode(node, start, sparse_bytes, frag_idx, sizes);
     }
 
     fn writeSymlink(w: *Writer, node: *Node, dirh: std.fs.Dir) !void {
