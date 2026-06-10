@@ -119,6 +119,19 @@ populate() {
     truncate -s 5G "$src/sparse.img"
     printf 'end' | dd of="$src/sparse.img" bs=1 seek=5000000000 conv=notrunc status=none
 
+    # preallocated extent (PREALLOC, never written): reads as zeros and drives
+    # the prealloc/hole branch of the dedup key
+    fallocate -l 200000 "$src/prealloc.dat"
+    # explicit mid-file hole (data, hole, data): a disk_bytenr==0 extent, same
+    # dedup-key branch, plus a sparse-block round-trip in the middle of a file
+    head -c 200000 /dev/urandom > "$src/holed.dat"
+    fallocate --punch-hole --offset 65536 --length 65536 "$src/holed.dat"
+    # nodatacow file: btrfs keeps no checksums for it (no mount option needed,
+    # chattr +C on the empty file), exercising the dedup key's nodatasum branch
+    : > "$src/nocow.dat"
+    chattr +C "$src/nocow.dat"
+    head -c 200000 /dev/urandom > "$src/nocow.dat"
+
     # special files (root only)
     mknod "$src/specials/null_c" c 1 3
     mknod "$src/specials/loop_b" b 7 0
