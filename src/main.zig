@@ -47,6 +47,10 @@ const std = @import("std");
 const linux = std.os.linux;
 const Dedup = @import("dedup.zig").Dedup;
 
+// Keep the info-level summary visible in release builds: std.log defaults to
+// .warn in ReleaseFast/ReleaseSmall, which would silence the final report.
+pub const std_options: std.Options = .{ .log_level = .info };
+
 const block_size: u32 = 131072;
 const block_log: u16 = 17;
 const meta_size: usize = 8192;
@@ -340,6 +344,16 @@ const Writer = struct {
     blocks_sparse: u64 = 0,
     files_deduped: u64 = 0,
     bytes_deduped: u64 = 0,
+    files_total: u32 = 0,
+    files_done: u32 = 0,
+
+    fn progress(w: *Writer, name: []const u8) void {
+        w.files_done += 1;
+        var width: usize = 1;
+        var n = w.files_total;
+        while (n >= 10) : (n /= 10) width += 1;
+        std.debug.print("\r[{d: >[3]}/{d}] {s}\x1b[K", .{ w.files_done, w.files_total, name, width });
+    }
 
     fn emit(w: *Writer, bytes: []const u8) !void {
         try w.out.writeAll(bytes);
@@ -538,6 +552,7 @@ const Writer = struct {
             }
             gop.value_ptr.* = node;
         }
+        w.progress(node.name);
         switch (node.kind) {
             .file => try w.writeFile(node, dirh),
             .symlink => try w.writeSymlink(node, dirh),
@@ -633,6 +648,7 @@ const Writer = struct {
     }
 
     fn writeDir(w: *Writer, node: *Node, dirh: std.fs.Dir, parent_inum: u32) !void {
+        w.progress(node.name);
         var n_subdirs: u32 = 0;
         for (node.children.items) |child| {
             switch (child.kind) {
@@ -845,12 +861,14 @@ pub fn main() !void {
         .enc_buf = try alloc.alloc(u8, 2 * block_size),
         .raw_buf = try alloc.alloc(u8, block_size),
         .dedup = try Dedup.init(alloc, src.fd),
+        .files_total = builder.inode_count,
     };
     try w.emit(&[_]u8{0} ** 96); // superblock placeholder
 
     try w.writeDir(root, src, builder.inode_count + 1);
 
     const bytes_used = try w.finish(&builder, root);
+    std.debug.print("\r\x1b[K", .{}); // clear the progress line
 
     std.log.info(
         "{d} inodes, {d} blocks + {d} tail fragments copied verbatim ({s}), {d} blocks stored raw, {d} sparse, {d} files deduped ({d} bytes), {d} bytes",
