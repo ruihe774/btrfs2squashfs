@@ -28,7 +28,15 @@ building.
 
 ```sh
 tests/run.sh              # end-to-end tests (self-elevates with sudo)
+COVERAGE=1 tests/run.sh   # same, plus kcov line coverage in zig-out/coverage/
 ```
+
+Coverage uses `kcov` (reads the debug binary's DWARF — no instrumentation, a
+plain `zig build` suffices). It runs the converter under kcov for each algo,
+merges the runs, and prints a per-file summary; open
+`zig-out/coverage/merged/index.html` for line detail. Currently ~98% of
+`src/main.zig` + `src/dedup.zig`; the gaps are error/edge paths (usage error,
+rare zstd header variants, dedup-disabled and nodatasum fallbacks).
 
 `tests/run.sh` is the test suite (there is no lint config or CI). It builds a
 real compressed btrfs loop filesystem in `/var/tmp` for each of zstd/zlib/lzo,

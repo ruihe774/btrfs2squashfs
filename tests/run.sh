@@ -12,20 +12,41 @@
 # the binary as the invoking user, then re-execs itself under sudo.
 #
 #   tests/run.sh            # run all cases
+#   COVERAGE=1 tests/run.sh # also collect source coverage with kcov
+#
+# Coverage uses kcov (no instrumentation: it reads the binary's DWARF line
+# info, so a plain debug `zig build` is enough). Results land in
+# zig-out/coverage/ — open zig-out/coverage/merged/index.html for line detail.
 #
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$REPO/zig-out/bin/btrfs2squashfs"
+COVERAGE="${COVERAGE:-0}"
+COVDIR="$REPO/zig-out/coverage"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo ">> building as $(id -un)"
     ( cd "$REPO" && zig build )
+    [ "$COVERAGE" = 1 ] && command -v kcov >/dev/null || \
+        { [ "$COVERAGE" = 1 ] && { echo "COVERAGE=1 but kcov not found"; exit 1; }; }
     echo ">> re-exec under sudo"
-    exec sudo "$0" "$@"
+    exec sudo COVERAGE="$COVERAGE" "$0" "$@"
 fi
 
 [ -x "$BIN" ] || { echo "binary missing: $BIN (run 'zig build')"; exit 1; }
+[ "$COVERAGE" = 1 ] && { rm -rf "$COVDIR"; mkdir -p "$COVDIR"; }
+
+# Run the converter, under kcov when collecting coverage. Each case writes to
+# its own kcov dir ($algo is in scope via the run_case caller); they are merged
+# at the end.
+convert() {
+    if [ "$COVERAGE" = 1 ]; then
+        kcov --include-path="$REPO/src" "$COVDIR/$algo" "$BIN" "$1" "$2"
+    else
+        "$BIN" "$1" "$2"
+    fi
+}
 
 WORK=/var/tmp/btrfs2squashfs-tests
 MNT="$WORK/mnt"
@@ -124,8 +145,8 @@ run_case() {  # run_case <algo> <expect_verbatim: yes|no>
     populate "$src"
 
     local log
-    log=$("$BIN" "$src" "$out" 2>&1)
-    echo "    $log"
+    log=$(convert "$src" "$out" 2>&1)
+    echo "    $(grep '^info:' <<<"$log" || echo "$log")"
 
     local copied deduped
     copied=$(sed -nE 's/.* ([0-9]+) blocks \+ .*/\1/p' <<<"$log")  # "N blocks + ..." = verbatim
@@ -171,6 +192,18 @@ run_case() {  # run_case <algo> <expect_verbatim: yes|no>
 run_case zstd yes
 run_case zlib yes
 run_case lzo  no
+
+if [ "$COVERAGE" = 1 ]; then
+    echo
+    echo "== coverage (kcov, merged over all cases) =="
+    kcov --merge "$COVDIR/merged" "$COVDIR/zstd" "$COVDIR/zlib" "$COVDIR/lzo" >/dev/null 2>&1
+    json="$COVDIR/merged/kcov-merged/coverage.json"
+    jq -r '.files[] | "    \(.percent_covered)%  \(.covered_lines)/\(.total_lines)  \(.file | sub(".*/";""))"' "$json"
+    jq -r '"    -----\n    \(.percent_covered)%  \(.covered_lines)/\(.total_lines)  TOTAL"' "$json"
+    echo "    html: $COVDIR/merged/index.html"
+    # written under sudo; hand it back so it can be browsed/removed as the user
+    [ -n "${SUDO_UID:-}" ] && chown -R "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$COVDIR"
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then
