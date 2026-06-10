@@ -745,7 +745,7 @@ pub fn main() !void {
 
     // phase 2: write the image (read access: dedup verifies candidates by
     // reading the already-written copy back)
-    const out = try std.fs.cwd().createFile(out_path, .{ .truncate = true, .read = true });
+    const out = try std.fs.cwd().createFile(out_path, .{ .truncate = true, .read = true, .exclusive = true, .mode = 0o600 });
     defer out.close();
     var w = Writer{
         .alloc = alloc,
