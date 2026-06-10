@@ -38,7 +38,7 @@
 // blocks and comparing them with the earlier copy, pread back from the
 // image, so no data blocks are kept in memory.
 //
-// Limitations (POC): no xattrs, directory listings < 64 KiB.
+// Limitations (POC): no xattrs.
 //
 // Usage: sudo btrfs2squashfs <source-dir> <output.squashfs>
 // (BTRFS_IOC_ENCODED_READ requires CAP_SYS_ADMIN.)
@@ -658,15 +658,34 @@ const Writer = struct {
             i = j;
         }
         const list_len = w.dir_tab.items.len - list_start;
-        if (list_len + 3 > 0xFFFF) return error.DirTooLargeForBasicInode;
-
-        try w.inodeCommon(node, @intFromEnum(node.kind));
+        const nlink = 2 + n_subdirs;
+        // squashfs records the listing size + 3 (readers subtract it back).
+        const file_size = list_len + 3;
         const iw = w.inode_tab.writer(w.alloc);
-        try iw.writeInt(u32, list_block, .little);
-        try iw.writeInt(u32, 2 + n_subdirs, .little); // nlink
-        try iw.writeInt(u16, @intCast(list_len + 3), .little);
-        try iw.writeInt(u16, list_offset, .little);
-        try iw.writeInt(u32, parent_inum, .little);
+        if (file_size > 0xFFFF) {
+            // The basic directory inode's file_size is a u16, so a listing of
+            // 64 KiB or more needs the extended directory inode (type 8),
+            // whose file_size is a u32. We emit no directory index (i_count =
+            // 0); both the kernel and unsquashfs read the listing
+            // sequentially and only consult the index to accelerate lookups,
+            // so its absence costs lookup speed, not correctness. Note the
+            // field order differs from the basic inode.
+            try w.inodeCommon(node, 8);
+            try iw.writeInt(u32, nlink, .little);
+            try iw.writeInt(u32, @intCast(file_size), .little);
+            try iw.writeInt(u32, list_block, .little);
+            try iw.writeInt(u32, parent_inum, .little);
+            try iw.writeInt(u16, 0, .little); // i_count: no directory index
+            try iw.writeInt(u16, list_offset, .little);
+            try iw.writeInt(u32, 0xFFFFFFFF, .little); // no xattrs
+        } else {
+            try w.inodeCommon(node, @intFromEnum(node.kind));
+            try iw.writeInt(u32, list_block, .little);
+            try iw.writeInt(u32, nlink, .little);
+            try iw.writeInt(u16, @intCast(file_size), .little);
+            try iw.writeInt(u16, list_offset, .little);
+            try iw.writeInt(u32, parent_inum, .little);
+        }
     }
 
     // metadata stream -> uncompressed metadata blocks (u16 header, bit 15 set)

@@ -127,10 +127,14 @@ Two phases, both driven from `main`:
   flags `NOI | NOID` reflect this.
 - Helpers `metaBlockOf` / `metaOffsetOf` translate a byte position in a metadata
   stream into the (block, offset) reference squashfs inodes use.
-- Files needing 64-bit start/size emit the *extended* file inode (type 9);
-  directories larger than 64 KiB are unsupported (`DirTooLargeForBasicInode`).
+- Files needing 64-bit start/size emit the *extended* file inode (type 9).
+  Directories whose listing reaches 64 KiB (the basic inode's u16 file_size
+  limit) emit the *extended* directory inode (type 8, u32 file_size) with no
+  directory index (`i_count = 0`) — readers walk the listing sequentially, so
+  the index only matters for lookup speed. The extended directory inode's
+  field order differs from the basic one (see `writeDir`).
 
 ## Limitations (POC)
 
-No xattrs; directory listings must be < 64 KiB. btrfs lzo extents are never
-copied verbatim. The output file is created with `O_EXCL` and mode `0o600`.
+No xattrs. btrfs lzo extents are never copied verbatim. The output file is
+created with `O_EXCL` and mode `0o600`.

@@ -132,6 +132,13 @@ populate() {
     chattr +C "$src/nocow.dat"
     head -c 200000 /dev/urandom > "$src/nocow.dat"
 
+    # large directory: thousands of entries push the listing past 64 KiB, the
+    # basic directory inode's u16 file_size limit, forcing the extended
+    # directory inode (type 8). 2000 * (8-byte entry header + 34-byte name) is
+    # ~84 KiB of listing, comfortably over the limit. Empty files keep it cheap.
+    mkdir -p "$src/bigdir"
+    ( cd "$src/bigdir" && touch $(seq -f 'entry_%04g_padding_padding_padding' 1 2000) )
+
     # special files (root only)
     mknod "$src/specials/null_c" c 1 3
     mknod "$src/specials/loop_b" b 7 0
@@ -195,6 +202,15 @@ run_case() {  # run_case <algo> <expect_verbatim: yes|no>
     hlnk=$(stat -c '%h' "$dst/hard.dat")
     check "hard.dat shares big.dat's inode, nlink=2 (got ino $bino/$hino, nlink ${hlnk:-0})" \
         "$([ "$bino" = "$hino" ] && [ "${hlnk:-0}" = 2 ] && echo 0 || echo 1)"
+
+    # large directory (>64 KiB listing -> extended dir inode, type 8): every
+    # entry must round-trip. Without the extended inode the conversion itself
+    # would abort before reaching these checks.
+    local nsrc ndst
+    nsrc=$(find "$src/bigdir" -mindepth 1 | wc -l)
+    ndst=$(find "$dst/bigdir" -mindepth 1 | wc -l)
+    check "bigdir round-trips all entries (src $nsrc / dst $ndst)" \
+        "$([ "${nsrc:-0}" -gt 0 ] && [ "$nsrc" = "$ndst" ] && echo 0 || echo 1)"
 
     # verbatim copy: present for zstd/zlib, impossible for lzo (segmented format)
     if [ "$expect_verbatim" = yes ]; then
