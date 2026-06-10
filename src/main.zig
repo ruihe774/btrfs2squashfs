@@ -207,6 +207,9 @@ const Builder = struct {
 
     fn idIndex(b: *Builder, id: u32) !u16 {
         const gop = try b.ids.getOrPut(b.alloc, id);
+        // squashfs indexes the id table with a u16, so it holds at most 65536
+        // distinct uid/gids.
+        if (gop.index > std.math.maxInt(u16)) return error.TooManyIds;
         return @intCast(gop.index);
     }
 
@@ -237,17 +240,23 @@ const Builder = struct {
         return node;
     }
 
-    fn scan(b: *Builder, dir: std.fs.Dir, node: *Node) !void {
+    fn scan(b: *Builder, dir: std.fs.Dir, node: *Node, dev: u64) !void {
         var it = dir.iterate();
         while (try it.next()) |entry| {
             if (entry.name.len > 256) return error.NameTooLong;
             const st = try std.posix.fstatat(dir.fd, entry.name, linux.AT.SYMLINK_NOFOLLOW);
+            // Don't cross filesystem boundaries. btrfs inode numbers are only
+            // unique within a subvolume (each subvolume gets its own st_dev),
+            // so descending into a nested subvolume or mount would alias its
+            // inodes against the parent tree's - collapsing unrelated files
+            // into bogus hard links. Skip the foreign entry entirely.
+            if (st.dev != dev) continue;
             const child = try b.nodeFromStat(entry.name, st);
             try node.children.append(b.alloc, child);
             if (child.kind == .dir) {
                 var sub = try dir.openDir(entry.name, .{ .iterate = true });
                 defer sub.close();
-                try b.scan(sub, child);
+                try b.scan(sub, child, dev);
             }
         }
         std.mem.sortUnstable(*Node, node.children.items, {}, struct {
@@ -360,23 +369,28 @@ const Writer = struct {
         // decompresses to exactly `span` bytes.
         if (ext.len == span and ext.unencoded_len == span and ext.unencoded_offset == 0) {
             switch (ext.compression) {
-                BTRFS_ENCODED_IO_COMPRESSION_ZSTD => if (w.lockCompressor(SQFS_COMP_ZSTD)) {
+                BTRFS_ENCODED_IO_COMPRESSION_ZSTD => {
                     // The frame's declared content size is the authority on
                     // the decompressed size: unencoded_len understates it for
                     // sector-padded inline extents. squashfs zstd
                     // decompressors also reject trailing garbage, so trim the
-                    // frame to its exact end.
-                    const frame = try zstdFrameParse(w.enc_buf[0..ext.encoded_len]);
-                    if (frame.size < span and frame.content_size == span)
-                        return .{ .entry = @intCast(frame.size), .bytes = w.enc_buf[0..frame.size], .kind = .copied };
+                    // frame to its exact end. An unparseable frame (should not
+                    // happen for kernel-written data) falls through to raw.
+                    if (zstdFrameParse(w.enc_buf[0..ext.encoded_len]) catch null) |frame| {
+                        // Lock the compressor only once the copy actually
+                        // qualifies, so a non-qualifying first candidate
+                        // doesn't lock the image to a compressor it never used.
+                        if (frame.size < span and frame.content_size == span and w.lockCompressor(SQFS_COMP_ZSTD))
+                            return .{ .entry = @intCast(frame.size), .bytes = w.enc_buf[0..frame.size], .kind = .copied };
+                    }
                 },
-                BTRFS_ENCODED_IO_COMPRESSION_ZLIB => if (w.lockCompressor(SQFS_COMP_GZIP)) {
+                BTRFS_ENCODED_IO_COMPRESSION_ZLIB => {
                     // No trimming needed: zlib decompressors (both the kernel
                     // and squashfs-tools) stop at the stream end and ignore
                     // the sector padding btrfs appends. For a non-inline
                     // extent unencoded_len (ram_bytes) is the exact
                     // decompressed size, and only small files are inlined.
-                    if (ext.encoded_len < span)
+                    if (ext.encoded_len < span and w.lockCompressor(SQFS_COMP_GZIP))
                         return .{ .entry = @intCast(ext.encoded_len), .bytes = w.enc_buf[0..ext.encoded_len], .kind = .copied };
                 },
                 else => {},
@@ -414,21 +428,22 @@ const Writer = struct {
     fn produceTailFragment(w: *Writer, file: std.fs.File, off: u64, tail: u32) !?usize {
         const ext = try encodedRead(file.handle, off, w.enc_buf);
         if (ext.len != tail or ext.unencoded_offset != 0) return null;
-        const frame_size: usize = switch (ext.compression) {
+        // Validate fully before locking the compressor: a non-qualifying first
+        // candidate must not lock the image to a compressor it never used.
+        const comp: u16, const frame_size: usize = switch (ext.compression) {
             BTRFS_ENCODED_IO_COMPRESSION_ZSTD => blk: {
-                if (!w.lockCompressor(SQFS_COMP_ZSTD)) return null;
                 const frame = zstdFrameParse(w.enc_buf[0..ext.encoded_len]) catch return null;
                 if (frame.content_size < tail or frame.content_size > block_size) return null;
-                break :blk frame.size;
+                break :blk .{ SQFS_COMP_ZSTD, frame.size };
             },
             BTRFS_ENCODED_IO_COMPRESSION_ZLIB => blk: {
-                if (!w.lockCompressor(SQFS_COMP_GZIP)) return null;
                 if (ext.unencoded_len > block_size) return null;
-                break :blk ext.encoded_len;
+                break :blk .{ SQFS_COMP_GZIP, ext.encoded_len };
             },
             else => return null,
         };
         if (frame_size >= tail) return null; // a raw data block would be smaller
+        if (!w.lockCompressor(comp)) return null;
         return frame_size;
     }
 
@@ -812,7 +827,7 @@ pub fn main() !void {
     const root_st = try std.posix.fstat(src.fd);
     const root = try builder.nodeFromStat("", root_st);
     if (root.kind != .dir) return error.SourceNotADirectory;
-    try builder.scan(src, root);
+    try builder.scan(src, root, root_st.dev);
     try builder.collect(root);
     builder.inode_count = @intCast(builder.inos.count());
     builder.number(root);
@@ -821,6 +836,9 @@ pub fn main() !void {
     // reading the already-written copy back)
     const out = try std.fs.cwd().createFile(out_path, .{ .truncate = true, .read = true, .exclusive = true, .mode = 0o600 });
     defer out.close();
+    // Don't leave a half-written image behind on failure: it would also block
+    // the next run, since the output is created O_EXCL.
+    errdefer std.fs.cwd().deleteFile(out_path) catch {};
     var w = Writer{
         .alloc = alloc,
         .out = out,
