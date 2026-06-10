@@ -185,8 +185,16 @@ run_case() {  # run_case <algo> <expect_verbatim: yes|no>
         diff <(emit_manifest "$src") <(emit_manifest "$dst") | head
     fi
 
-    # dedup: dup.dat + hard.dat must both collapse onto big.dat
-    check "dedup collapsed >=2 files (got ${deduped:-0})" "$([ "${deduped:-0}" -ge 2 ] && echo 0 || echo 1)"
+    # dedup: dup.dat collapses onto big.dat (hard.dat is a real hard link, not
+    # a dedup - it is checked separately below)
+    check "dedup collapsed >=1 file (got ${deduped:-0})" "$([ "${deduped:-0}" -ge 1 ] && echo 0 || echo 1)"
+
+    # hard link: hard.dat and big.dat must round-trip as one inode with nlink 2
+    local bino hino hlnk
+    bino=$(stat -c '%i' "$dst/big.dat"); hino=$(stat -c '%i' "$dst/hard.dat")
+    hlnk=$(stat -c '%h' "$dst/hard.dat")
+    check "hard.dat shares big.dat's inode, nlink=2 (got ino $bino/$hino, nlink ${hlnk:-0})" \
+        "$([ "$bino" = "$hino" ] && [ "${hlnk:-0}" = 2 ] && echo 0 || echo 1)"
 
     # verbatim copy: present for zstd/zlib, impossible for lzo (segmented format)
     if [ "$expect_verbatim" = yes ]; then

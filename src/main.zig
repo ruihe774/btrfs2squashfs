@@ -26,7 +26,12 @@
 // uncompressed squashfs blocks - still no recompression. All-zero blocks
 // become squashfs sparse blocks. Metadata tables are stored uncompressed.
 //
-// Duplicate files (including hard links) are stored once: candidates are
+// Hard links (multiple names for one btrfs inode) are preserved as one
+// squashfs inode: every name interns to the same inode number, the first
+// name written emits the inode, and the rest just point their directory
+// entries at it.
+//
+// Distinct files with identical content are stored once: candidates are
 // found by hashing the per-sector checksums btrfs already keeps in its csum
 // tree (read via BTRFS_IOC_TREE_SEARCH_V2 - no checksum is computed here),
 // then confirmed - before the duplicate writes anything - by producing its
@@ -174,6 +179,7 @@ const Node = struct {
     rdev: u32 = 0,
     ino: u64 = 0, // btrfs inode number, used for dedup key lookups
     inum: u32 = 0,
+    nlink: u32 = 1, // hard-link count within the scanned tree
     children: std.ArrayListUnmanaged(*Node) = .{},
     // location of this node's inode in the inode table, filled during write
     ref_block: u32 = 0,
@@ -187,9 +193,16 @@ fn squashfsRdev(st_rdev: u64) u32 {
     return (minor & 0xff) | (major << 8) | ((minor & 0xffffff00) << 12);
 }
 
+const InodeInfo = struct { inum: u32, nlink: u32 };
+
 const Builder = struct {
     alloc: std.mem.Allocator,
     ids: std.AutoArrayHashMapUnmanaged(u32, void) = .{},
+    // distinct btrfs inodes -> squashfs inode number + in-tree link count.
+    // Hard links share a btrfs inode, so they intern to the same inum here
+    // (just as uid/gid intern in idIndex) - that is what makes them share a
+    // single squashfs inode.
+    inos: std.AutoArrayHashMapUnmanaged(u64, InodeInfo) = .{},
     inode_count: u32 = 0,
 
     fn idIndex(b: *Builder, id: u32) !u16 {
@@ -244,10 +257,25 @@ const Builder = struct {
         }.lt);
     }
 
+    // pass 1: intern every node's btrfs inode and count occurrences. Hard
+    // links collapse onto one entry; its nlink ends up the number of tree
+    // entries that share the inode.
+    fn collect(b: *Builder, node: *Node) !void {
+        const gop = try b.inos.getOrPut(b.alloc, node.ino);
+        if (gop.found_existing) {
+            gop.value_ptr.nlink += 1;
+        } else {
+            gop.value_ptr.* = .{ .inum = @intCast(gop.index + 1), .nlink = 1 };
+        }
+        for (node.children.items) |child| try b.collect(child);
+    }
+
+    // pass 2: stamp the interned inum and finalized link count onto each node.
     fn number(b: *Builder, node: *Node) void {
+        const info = b.inos.get(node.ino).?;
+        node.inum = info.inum;
+        node.nlink = info.nlink;
         for (node.children.items) |child| b.number(child);
-        b.inode_count += 1;
-        node.inum = b.inode_count;
     }
 };
 
@@ -292,6 +320,10 @@ const Writer = struct {
     raw_buf: []u8,
     dedup: Dedup,
     dedup_map: std.AutoHashMapUnmanaged(u64, FileRecord) = .{},
+    // btrfs inode -> the node whose squashfs inode was already written for it.
+    // The first tree entry of a hard-link group writes the inode; the rest
+    // just point their directory entries at it.
+    links: std.AutoHashMapUnmanaged(u64, *Node) = .{},
     compressor: ?u16 = null,
     blocks_copied: u64 = 0,
     frags_copied: u64 = 0,
@@ -455,13 +487,15 @@ const Writer = struct {
     fn writeFileInode(w: *Writer, node: *Node, start: u64, sparse_bytes: u64, frag_idx: u32, sizes: []const u32) !void {
         const size = node.size;
         const iw = w.inode_tab.writer(w.alloc);
-        if (start > std.math.maxInt(u32) or size > std.math.maxInt(u32)) {
+        // The basic file inode has no nlink field, so a hard-linked file must
+        // use the extended inode even when its start/size would fit in 32 bits.
+        if (start > std.math.maxInt(u32) or size > std.math.maxInt(u32) or node.nlink > 1) {
             // extended file inode: 64-bit start and size
             try w.inodeCommon(node, 9);
             try iw.writeInt(u64, if (sizes.len == 0) 0 else start, .little);
             try iw.writeInt(u64, size, .little);
             try iw.writeInt(u64, sparse_bytes, .little);
-            try iw.writeInt(u32, 1, .little); // nlink
+            try iw.writeInt(u32, node.nlink, .little); // nlink
             try iw.writeInt(u32, frag_idx, .little);
             try iw.writeInt(u32, 0, .little); // fragment offset
             try iw.writeInt(u32, 0xFFFFFFFF, .little); // no xattrs
@@ -473,6 +507,27 @@ const Writer = struct {
             try iw.writeInt(u32, @intCast(size), .little);
         }
         for (sizes) |s| try iw.writeInt(u32, s, .little);
+    }
+
+    // Dispatches a non-directory child. Hard-linked entries (nlink > 1) share
+    // one squashfs inode: the first one written records itself in `links`; the
+    // rest just copy its inode location into their directory entry and write
+    // nothing.
+    fn writeNonDir(w: *Writer, node: *Node, dirh: std.fs.Dir) !void {
+        if (node.nlink > 1) {
+            const gop = try w.links.getOrPut(w.alloc, node.ino);
+            if (gop.found_existing) {
+                node.ref_block = gop.value_ptr.*.ref_block;
+                node.ref_offset = gop.value_ptr.*.ref_offset;
+                return;
+            }
+            gop.value_ptr.* = node;
+        }
+        switch (node.kind) {
+            .file => try w.writeFile(node, dirh),
+            .symlink => try w.writeSymlink(node, dirh),
+            else => try w.writeSpecial(node),
+        }
     }
 
     fn writeFile(w: *Writer, node: *Node, dirh: std.fs.Dir) !void {
@@ -549,7 +604,7 @@ const Writer = struct {
         const target = try dirh.readLink(node.name, &buf);
         try w.inodeCommon(node, @intFromEnum(node.kind));
         const iw = w.inode_tab.writer(w.alloc);
-        try iw.writeInt(u32, 1, .little); // nlink
+        try iw.writeInt(u32, node.nlink, .little); // nlink
         try iw.writeInt(u32, @intCast(target.len), .little);
         try iw.writeAll(target);
     }
@@ -557,7 +612,7 @@ const Writer = struct {
     fn writeSpecial(w: *Writer, node: *Node) !void {
         try w.inodeCommon(node, @intFromEnum(node.kind));
         const iw = w.inode_tab.writer(w.alloc);
-        try iw.writeInt(u32, 1, .little); // nlink
+        try iw.writeInt(u32, node.nlink, .little); // nlink
         if (node.kind == .blkdev or node.kind == .chrdev)
             try iw.writeInt(u32, node.rdev, .little);
     }
@@ -572,9 +627,7 @@ const Writer = struct {
                     defer sub.close();
                     try w.writeDir(child, sub, node.inum);
                 },
-                .file => try w.writeFile(child, dirh),
-                .symlink => try w.writeSymlink(child, dirh),
-                else => try w.writeSpecial(child),
+                else => try w.writeNonDir(child, dirh),
             }
         }
         // directory listing (children already have inode refs)
@@ -741,6 +794,8 @@ pub fn main() !void {
     const root = try builder.nodeFromStat("", root_st);
     if (root.kind != .dir) return error.SourceNotADirectory;
     try builder.scan(src, root);
+    try builder.collect(root);
+    builder.inode_count = @intCast(builder.inos.count());
     builder.number(root);
 
     // phase 2: write the image (read access: dedup verifies candidates by

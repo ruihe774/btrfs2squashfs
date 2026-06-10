@@ -44,7 +44,8 @@ real compressed btrfs loop filesystem in `/var/tmp` for each of zstd/zlib/lzo,
 populates it with generated payloads (multi-block, incompressible, inline,
 sparse 5 GiB, duplicates, hard links, symlinks, special files), converts it,
 and asserts the squashfs round-trips byte-for-byte (`unsquashfs` + `diff -r`),
-preserves metadata, deduplicates, and copies verbatim where expected. It builds
+preserves metadata, preserves hard links (shared inode, nlink), deduplicates,
+and copies verbatim where expected. It builds
 as the invoking user, then re-execs under `sudo` (needs loop mount + mknod +
 `CAP_SYS_ADMIN`). Use `/var/tmp`, never `/tmp` — the payloads are large.
 
@@ -63,8 +64,12 @@ Three source files, two executables:
 
 Two phases, both driven from `main`:
 
-1. **Scan** (`Builder`): walk the source tree into a `Node` tree, intern uid/gid
-   into an id table, and assign inode numbers post-order (`Builder.number`).
+1. **Scan** (`Builder`): walk the source tree into a `Node` tree and intern
+   uid/gid into an id table. Then `Builder.collect` interns each node's btrfs
+   inode number (counting occurrences), and `Builder.number` stamps the
+   resulting squashfs inode number + link count onto every node. Interning the
+   btrfs inode is what makes hard links (which share a btrfs inode) collapse
+   onto one squashfs inode number.
 2. **Write** (`Writer`): walk the `Node` tree depth-first (`writeDir`), emitting
    squashfs structures to the output file as it goes, then `finish` writes the
    metadata/fragment/id tables and back-patches the 96-byte superblock at
@@ -95,6 +100,15 @@ Two phases, both driven from `main`:
   block's bytes **without writing**. `writeBlock` etc. produce-then-emit. This
   split exists so dedup can regenerate a candidate's blocks and compare them
   without buffering.
+- **Hard links** (`Writer.writeNonDir` + `Writer.links`): entries sharing a
+  btrfs inode already share a squashfs inode number (interned in `collect`).
+  The first one reached in the write walk emits the inode and records its node
+  in `w.links`; later ones copy that node's `ref_block`/`ref_offset` into their
+  directory entry and write nothing. This is distinct from dedup (below), which
+  collapses *different* inodes with identical content. The link count
+  (`node.nlink`, in-tree occurrences) is written into the inode; because the
+  basic file inode has no nlink field, a hard-linked regular file is forced to
+  the extended inode (type 9) regardless of its size.
 - **Dedup** (`src/dedup.zig` + `Writer.matchesRecord`): candidate duplicates
   are found by hashing the per-sector checksums btrfs already keeps in its csum
   tree (read via `BTRFS_IOC_TREE_SEARCH_V2` — no checksum is computed here) into
