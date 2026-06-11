@@ -173,7 +173,7 @@ const Kind = enum(u16) {
 };
 
 const Node = struct {
-    name: []const u8,
+    name: [:0]const u8,
     kind: Kind,
     mode: u16,
     uid_idx: u16,
@@ -231,7 +231,7 @@ const Builder = struct {
         };
         const node = try b.alloc.create(Node);
         node.* = .{
-            .name = try b.alloc.dupe(u8, name),
+            .name = try b.alloc.dupeZ(u8, name),
             .kind = kind,
             .mode = @truncate(m & 0o7777),
             .uid_idx = try b.idIndex(st.uid),
@@ -561,7 +561,7 @@ const Writer = struct {
     }
 
     fn writeFile(w: *Writer, node: *Node, dirh: std.fs.Dir) !void {
-        var file = try dirh.openFile(node.name, .{});
+        var file = try dirh.openFileZ(node.name, .{});
         defer file.close();
         const size = node.size;
         const tail: u32 = @intCast(size % block_size);
@@ -631,7 +631,7 @@ const Writer = struct {
 
     fn writeSymlink(w: *Writer, node: *Node, dirh: std.fs.Dir) !void {
         var buf: [4096]u8 = undefined;
-        const target = try dirh.readLink(node.name, &buf);
+        const target = try dirh.readLinkZ(node.name, &buf);
         try w.inodeCommon(node, @intFromEnum(node.kind));
         const iw = w.inode_tab.writer(w.alloc);
         try iw.writeInt(u32, node.nlink, .little); // nlink
@@ -654,7 +654,7 @@ const Writer = struct {
             switch (child.kind) {
                 .dir => {
                     n_subdirs += 1;
-                    var sub = try dirh.openDir(child.name, .{});
+                    var sub = try dirh.openDirZ(child.name, .{});
                     defer sub.close();
                     try w.writeDir(child, sub, node.inum);
                 },
@@ -838,7 +838,7 @@ pub fn main() !void {
 
     // phase 1: scan the tree
     var builder = Builder{ .alloc = alloc };
-    var src = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
+    var src = try std.fs.cwd().openDirZ(src_path, .{ .iterate = true });
     defer src.close();
     const root_st = try std.posix.fstat(src.fd);
     const root = try builder.nodeFromStat("", root_st);
@@ -850,11 +850,11 @@ pub fn main() !void {
 
     // phase 2: write the image (read access: dedup verifies candidates by
     // reading the already-written copy back)
-    const out = try std.fs.cwd().createFile(out_path, .{ .truncate = true, .read = true, .exclusive = true, .mode = 0o600 });
+    const out = try std.fs.cwd().createFileZ(out_path, .{ .truncate = true, .read = true, .exclusive = true, .mode = 0o600 });
     defer out.close();
     // Don't leave a half-written image behind on failure: it would also block
     // the next run, since the output is created O_EXCL.
-    errdefer std.fs.cwd().deleteFile(out_path) catch {};
+    errdefer std.fs.cwd().deleteFileZ(out_path) catch {};
     var w = Writer{
         .alloc = alloc,
         .out = out,
