@@ -561,7 +561,11 @@ const Writer = struct {
     }
 
     fn writeFile(w: *Writer, node: *Node, dirh: std.fs.Dir) !void {
-        var file = try dirh.openFileZ(node.name, .{});
+        // Encoded reads bypass page caches. Enable O_DIRECT so that normal reads can have a consistent behavior
+        var flags: std.posix.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOCTTY = true, .DIRECT = true };
+        if (@hasField(std.posix.O, "LARGEFILE")) flags.LARGEFILE = true;
+        const fd = try std.posix.openatZ(dirh.fd, node.name, flags, 0);
+        var file: std.fs.File = .{ .handle = fd };
         defer file.close();
         const size = node.size;
         const tail: u32 = @intCast(size % block_size);
